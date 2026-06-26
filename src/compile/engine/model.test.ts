@@ -8,9 +8,40 @@ import {
   estimateCostUsd,
   newUsageMeter,
   recordUsage,
+  withRetry,
+  isRetryableError,
+  type ModelClient,
 } from "./model.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// A stub that fails the first `failTimes` calls with `err`, then returns `ok`. Counts calls.
+function flakyClient(
+  failTimes: number,
+  err: Error,
+  ok = "OK",
+): { client: ModelClient; calls: () => number } {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    client: {
+      async complete(): Promise<string> {
+        calls++;
+        if (calls <= failTimes) throw err;
+        return ok;
+      },
+    },
+  };
+}
+
+// A sleep that records the delays it was asked to wait (so backoff is asserted without real time).
+function recordingSleep(): {
+  fn: (ms: number) => Promise<void>;
+  delays: number[];
+} {
+  const delays: number[] = [];
+  return { delays, fn: async (ms: number) => void delays.push(ms) };
+}
 
 // ── Provider selection (borrow-the-harness: run on the Claude Code subscription, no API key) ──
 
@@ -129,8 +160,9 @@ test("parseClaudeCodeOutput falls back to raw text when output isn't the JSON en
 });
 
 test("estimateCostUsd prices by model family (API path, where claude doesn't hand us a $ figure)", () => {
-  // 1M in + 1M out on Opus = $15 + $75; on Sonnet = $3 + $15. Unknown model → null (honest).
-  assert.equal(estimateCostUsd("claude-opus-4-8", 1_000_000, 1_000_000), 90);
+  // 1M in + 1M out on Opus 4.8 = $5 + $25 = $30; on Sonnet 4.6 = $3 + $15 = $18. Unknown model → null (honest).
+  // Pricing per platform.claude.com/docs/en/about-claude/models/overview (verified 2026-06-26).
+  assert.equal(estimateCostUsd("claude-opus-4-8", 1_000_000, 1_000_000), 30);
   assert.equal(estimateCostUsd("claude-sonnet-4-6", 1_000_000, 1_000_000), 18);
   assert.equal(estimateCostUsd("some-unknown-model", 1000, 1000), null);
 });
@@ -210,4 +242,110 @@ test("the abort signal is a real AbortSignal — wired to fetch's signal option"
     "deadline yields an AbortSignal fetch accepts",
   );
   d.clear();
+});
+
+// ── Per-call retry (unattended robustness: a transient hiccup must not abort a whole compile) ──
+
+test("isRetryableError: TRANSIENT failures retry — timeout, usage limit, network, 5xx, empty", () => {
+  for (const m of [
+    "claude -p timed out after 300000ms",
+    "claude -p failed (usage limit reached)",
+    "Anthropic request failed (network): ECONNRESET",
+    "Anthropic API error 529 Overloaded",
+    "Anthropic API error 503 Service Unavailable",
+    "Anthropic API returned no text content",
+  ]) {
+    assert.equal(isRetryableError(new Error(m)), true, `should retry: ${m}`);
+  }
+});
+
+test("isRetryableError: PERMANENT failures do NOT retry — auth / no-key / missing binary", () => {
+  for (const m of [
+    'claude -p failed (Not logged in). If it says "Not logged in"...',
+    "ANTHROPIC_API_KEY is not set. The compile-time model call...",
+    "Could not run the 'claude' CLI (ENOENT). Install Claude Code...",
+    "Anthropic API error 401 Unauthorized",
+    "Anthropic API error 403 authentication_error",
+  ]) {
+    assert.equal(
+      isRetryableError(new Error(m)),
+      false,
+      `should NOT retry: ${m}`,
+    );
+  }
+});
+
+test("withRetry: a clean first call passes straight through (one call, no sleep)", async () => {
+  const { client, calls } = flakyClient(0, new Error("unused"));
+  const sl = recordingSleep();
+  const r = await withRetry(client, { sleep: sl.fn }).complete("x");
+  assert.equal(r, "OK");
+  assert.equal(calls(), 1, "no retry when the first call succeeds");
+  assert.equal(sl.delays.length, 0, "never slept");
+});
+
+test("withRetry: a TRANSIENT failure then success — retries and returns the good result", async () => {
+  const { client, calls } = flakyClient(
+    1,
+    new Error("claude -p timed out after 300000ms"),
+  );
+  const sl = recordingSleep();
+  const r = await withRetry(client, {
+    sleep: sl.fn,
+    baseDelayMs: 1000,
+  }).complete("x");
+  assert.equal(r, "OK");
+  assert.equal(calls(), 2, "one retry after the transient failure");
+  assert.deepEqual(sl.delays, [1000], "backed off once before the retry");
+});
+
+test("withRetry: exhausting maxAttempts throws the last error (called exactly maxAttempts times)", async () => {
+  const { client, calls } = flakyClient(
+    99,
+    new Error("claude -p failed (usage limit reached)"),
+  );
+  const sl = recordingSleep();
+  await assert.rejects(
+    withRetry(client, {
+      sleep: sl.fn,
+      maxAttempts: 3,
+      baseDelayMs: 1000,
+    }).complete("x"),
+    /usage limit/,
+  );
+  assert.equal(calls(), 3, "tried exactly maxAttempts times");
+  assert.equal(
+    sl.delays.length,
+    2,
+    "slept between the 3 attempts (after #1 and #2)",
+  );
+});
+
+test("withRetry: a PERMANENT error throws immediately — no retry, no sleep", async () => {
+  const { client, calls } = flakyClient(
+    99,
+    new Error("claude -p failed (Not logged in)"),
+  );
+  const sl = recordingSleep();
+  await assert.rejects(
+    withRetry(client, { sleep: sl.fn }).complete("x"),
+    /Not logged in/,
+  );
+  assert.equal(calls(), 1, "permanent error is not retried");
+  assert.equal(sl.delays.length, 0, "never slept");
+});
+
+test("withRetry: backoff is exponential and capped at maxDelayMs", async () => {
+  const { client } = flakyClient(99, new Error("network blip"));
+  const sl = recordingSleep();
+  await assert.rejects(
+    withRetry(client, {
+      sleep: sl.fn,
+      maxAttempts: 5,
+      baseDelayMs: 1000,
+      maxDelayMs: 4000,
+    }).complete("x"),
+  );
+  // 1000, 2000, 4000 (cap), 4000 — exponential then clamped.
+  assert.deepEqual(sl.delays, [1000, 2000, 4000, 4000]);
 });
