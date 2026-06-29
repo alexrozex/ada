@@ -86,9 +86,13 @@ export function recordUsage(
   if (estimated) meter.costEstimated = true;
 }
 
-/** Published per-million-token prices, by model family — for estimating the API path's cost. */
+/**
+ * Published per-million-token prices, by model family — for estimating the API path's cost.
+ * Source: https://platform.claude.com/docs/en/about-claude/models/overview (verified 2026-06-26).
+ * Opus 4.8 $5/$25 · Sonnet 4.6 $3/$15 · Haiku 4.5 $1/$5. (The old $15/$75 was Opus 4.1, now deprecated.)
+ */
 const PRICE_PER_MTOK: Record<string, { in: number; out: number }> = {
-  opus: { in: 15, out: 75 },
+  opus: { in: 5, out: 25 },
   sonnet: { in: 3, out: 15 },
   haiku: { in: 1, out: 5 },
 };
@@ -468,6 +472,87 @@ export function claudeCodeClient(options: AnthropicOptions = {}): ModelClient {
   };
 }
 
+// ── Per-call retry (unattended robustness) ───────────────────────────────────────────────────
+
+/**
+ * Should a failed compile-time call be retried? TRANSIENT failures (a timeout, a momentary usage /
+ * rate limit, a network blip, a 5xx/overload, an empty response) recover on a backed-off retry — the
+ * exact class that killed two unattended compiles when run concurrently. PERMANENT failures (not
+ * logged in, no API key, a missing `claude` binary, an auth error) will NEVER recover by retrying, so
+ * they fail fast. Pure (message in, verdict out) → unit-testable. The default is transient-biased: an
+ * unknown error retries, because aborting a long compile is costlier than one extra call.
+ */
+export function isRetryableError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  // Permanent — a retry cannot fix these, so don't waste the backoff.
+  if (msg.includes("not logged in")) return false;
+  if (msg.includes("anthropic_api_key is not set")) return false;
+  if (msg.includes("could not run the 'claude' cli")) return false;
+  if (/\b(401|403)\b/.test(msg) || msg.includes("authentication")) return false;
+  // Everything else is treated as transient (timeout / usage limit / network / 5xx / empty / unknown).
+  return true;
+}
+
+/** Tuning for `withRetry`. All optional; the defaults suit an unattended scheduled compile. */
+export interface RetryOptions {
+  /** Total attempts INCLUDING the first. Default 3 (env `ADA_MODEL_RETRIES` overrides the default). */
+  maxAttempts?: number;
+  /** First backoff in ms; each retry doubles it. Default 2000. */
+  baseDelayMs?: number;
+  /** Backoff ceiling in ms (the doubling is clamped here). Default 30000. */
+  maxDelayMs?: number;
+  /** Injected sleep (tests pass a no-op recorder); default is a real unref'd timer. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Override the retryable classifier (tests). Default `isRetryableError`. */
+  isRetryable?: (err: unknown) => boolean;
+  /** Observe each retry (attempt #, the delay about to be waited, the error) — e.g. progress logging. */
+  onRetry?: (attempt: number, delayMs: number, err: unknown) => void;
+}
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((r) => {
+    const t = setTimeout(r, ms);
+    (t as { unref?: () => void }).unref?.();
+  });
+
+/**
+ * Decorate any `ModelClient` so a TRANSIENT failure backs off and retries instead of aborting the
+ * whole compile. Exponential backoff (baseDelayMs · 2^n, clamped to maxDelayMs); permanent errors
+ * (auth/no-key/missing-binary) throw immediately. This is the load-bearing fix for unattended Ada:
+ * one hung/limit-hit call no longer kills a multi-call compile. Wrapping is transparent — still ONE
+ * logical compile-time call per `complete()` from the caller's view (A1/A9), just resilient.
+ */
+export function withRetry(
+  client: ModelClient,
+  options: RetryOptions = {},
+): ModelClient {
+  const maxAttempts = options.maxAttempts ?? 3;
+  const baseDelayMs = options.baseDelayMs ?? 2000;
+  const maxDelayMs = options.maxDelayMs ?? 30_000;
+  const sleep = options.sleep ?? realSleep;
+  const retryable = options.isRetryable ?? isRetryableError;
+  return {
+    async complete(prompt: string): Promise<string> {
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          return await client.complete(prompt);
+        } catch (err) {
+          lastErr = err;
+          if (attempt >= maxAttempts || !retryable(err)) throw err;
+          const delayMs = Math.min(
+            maxDelayMs,
+            baseDelayMs * 2 ** (attempt - 1),
+          );
+          options.onRetry?.(attempt, delayMs, err);
+          await sleep(delayMs);
+        }
+      }
+      throw lastErr; // unreachable: the loop returns or throws on the last attempt
+    },
+  };
+}
+
 /** Options for the provider-selecting default client: tuning + an explicit provider override. */
 export interface DefaultClientOptions extends AnthropicOptions {
   /** Force a provider (a `--provider` flag). Undefined → `resolveProvider` decides. */
@@ -493,7 +578,15 @@ export function defaultModelClient(
     ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.meter ? { meter: options.meter } : {}),
   };
-  return provider === "claude-code"
-    ? claudeCodeClient(tuning)
-    : anthropicClient(tuning);
+  const base =
+    provider === "claude-code"
+      ? claudeCodeClient(tuning)
+      : anthropicClient(tuning);
+  // Resilience for unattended runs: a transient timeout / rate-limit / network hiccup retries with
+  // backoff instead of aborting the whole compile. Permanent errors (auth/no-key) still fail fast.
+  // `ADA_MODEL_RETRIES` overrides the attempt count (0/1 → effectively no retry); default 3.
+  const envRetries = Number(process.env["ADA_MODEL_RETRIES"]);
+  const maxAttempts =
+    Number.isFinite(envRetries) && envRetries >= 1 ? Math.floor(envRetries) : 3;
+  return withRetry(base, { maxAttempts });
 }
